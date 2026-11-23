@@ -1,267 +1,437 @@
 # Touchline API • football, identity and fantasy
 
-[Team home](MASTER.md) · [Schemas and joins](DB.md) · [UI consumers](touchline_main.md) · [Football producer](touchline_sync.md)
+[Team home](MASTER.md) · [Schemas and joins](DB.md) · [UI consumers](touchline_main.md) · [Football producer](touchline_sync.md) · [Sync Sprints 3–5](touchline_sync_sprints_3-5.md)
 
-**Source • `touchline_api`, `phathu-dev@f887905`, 23 November 2026.** The dedicated ASP.NET Core service is the intended public contract for phones and web. Phatu reports it has no hosted deployment yet. The similarly named folder inside Main implements a different contract. Route paths below are relative to `/api/v1`.
+**Source • `touchline-api`, `main@15b0a53` plus open PRs #14 and #8–#13, 23 November 2026.**
+- `main` has Sprint 1 (PR #6, merged).
+- Sprints 2–8 are in seven open PRs, all based on `main`. They merge in this order: #14, #8, #9, #10, #11, #12, #13.
+- This guide describes the code at the tip of that stack (`sprint/8-sync-alignment`). Where a feature arrives in a later PR, the sprint is named.
+- The tip's full suite is 419 passed, 0 skipped, 0 failed, including every PostgreSQL test.
+- This replaces the earlier baseline (`phathu-dev@f887905`), which is also on `main`.
+
+The dedicated ASP.NET Core (.NET 10) service is the intended public contract for phones and web. It has no hosted deployment yet. Route paths below are relative to `/api/v1`.
+
+**Status of the rules here:** the rules below are what the code does. The product decisions behind them are **proposed, awaiting team sign-off**. See [MASTER decisions](MASTER.md#decisions-and-open-questions). In particular, they conflict with Phatu's handbook on captaincy, autosubs, budget and Free Hit.
 
 ## Trace a request
 
-1. `Program.cs` loads development settings, requires the Touchline connection string, registers Npgsql and the EF Core context, configures JSON string enums, CORS, authentication, authorization and controllers. Reads default to no tracking. A writer explicitly tracks or adds changed app entities.
-2. A public controller resolves its service. For example, `FixturesController` resolves the current season for Sportmonks league 806, accepts optional ISO date bounds and calls `FootballService`. The service converts date bounds to UTC, filters on **internal** season ID, orders by kickoff, joins club names and projects DTOs. The response contains `season`, `count` and `fixtures`. Unknown opponents can read “TBD”. A missing score is meaningful before kickoff.
-3. Protected routes validate the Supabase access token first. The issuer is the environment’s Auth URL, the audience defaults to `authenticated`, and the configured signing keys verify the signature. `CurrentUser` takes the UUID from the token subject. `UserService` resolves it to `app.users.id`. Someone supplying another user’s ID in a request cannot use that field to choose which team to edit.
-4. A fantasy controller loads the user, season, team, gameweek calendar and applicable rules. A rule violation returns structured errors. A valid change goes through the appropriate service and transaction to `app`. EF’s save guard also rejects writes to entities mapped to `football` and `sync`. The API reads committed worker output between requests.
-5. The response contains a projection for the screen. A squad or snapshot GET carries an ETag with the version. The client can reload that representation after a change. Development also exposes the route contract at `/openapi/v1.json` and Scalar at `/scalar`.
+1. **Startup.** `Program.cs` loads settings and validates them (in Staging and Production only). It registers Npgsql and EF Core, JSON string enums, CORS, rate limiting, authentication and controllers.
+2. **Public reads.** A public controller reads Postgres only. The API never calls Sportmonks or the worker: Postgres is the only handoff, and a test enforces it.
+   - Every read of `football.match_events` and `football.player_lineups` goes through `Data/FootballReads.cs`. It drops rows where `withdrawn_at` is set (see [withdrawn rows](#withdrawn-rows-and-freshness)).
+3. **Protected routes.** These validate the Supabase access token first. The user always comes from the token's `sub`, never from the request body.
+4. **Fantasy writes.** These run in one transaction on `app` tables, with a team-row lock and a version concurrency token.
+   - The DB role cannot write `football` or `sync`. EF's save guard also refuses writes to them.
+5. **Responses.** Public and fantasy GETs carry ETags. Errors are RFC 9110 problem details with a machine-readable `code`.
 
-## Contract by user journey
+## Routes (Sprints 1–8)
 
-| Method and path | Who and what |
+### Public football and rules
+
+| Method and path | What it returns | Sprint |
+|---|---|---|
+| GET `/health` | Minimal liveness. No hosts, versions, job names or error text | 1, trimmed in 6 |
+| GET `/health/ready` | Database readiness | 6 |
+| GET `/health/freshness` | Data freshness. Stale after 48 h; not `fresh` while any live fixture is stalled. Adds `stalledLiveFixtures` (a count) | 6, 8 |
+| GET `/seasons/current` | The PSL season flagged current. 503 if none is flagged | 1 |
+| GET `/teams` | Clubs in the current PSL season | 1 |
+| GET `/clubs`, `/clubs/{id}` | Clubs with stable internal id (used for favourite club) and Sportmonks id. Crest is `null` for a placeholder image. Club detail | 3, 6 |
+| GET `/players`, `/players/{id}` | Players with position, current club, price and availability. Opt-in `?page`/`?pageSize`. Player detail by id, never by name | 1, 6 |
+| GET `/player-rankings` | Port of the web app's Netlify function | 6 |
+| GET `/fixtures?from=…&to=…` | Current-season fixtures. Kickoff field is `kickoffUtc` (`kickoff` is a deprecated alias for the web rollout) | 1 |
+| GET `/fixtures/{id}` | Match detail: teams, score, phase, clock, ordered events (paged), lineups, substitutions, team stats, coverage flags, freshness and revision | 1, 8 |
+| GET `/matches` | Compatibility shape for the web client | 6 |
+| GET `/standings` | PSL table: derived from final results, plus official deductions from `football.standings` | 1 |
+| GET `/gameweeks?seasonId=…` | Calendar with persisted week `number` (null before V043) and `readyToScore` | 1, 2 |
+| GET `/rules` | The machine-readable rulebook `2026-27.v1`. Every number comes from configuration | 2 |
+
+### Signed-in manager (`Authorization: Bearer <Supabase token>`)
+
+| Method and path | What it does | Sprint |
+|---|---|---|
+| GET, PATCH `/me` | Find or provision the profile. PATCH sets username, favourite club and onboarding | 3 |
+| GET, PATCH `/me/notifications` | Notification preferences | 3 |
+| GET `/me/export` | Data export. Needs a sign-in within the last 10 minutes | 3 |
+| DELETE `/me` | Account deletion (anonymisation). Needs a recent sign-in. League ownership passes on or the league is archived | 3 |
+| GET, POST, PATCH `/fantasy/team` | Read, create or rename the caller's team (name 3–30 characters) | 1, 3 |
+| GET `/fantasy/team/snapshot` | Team, squad, chips, free transfers, deadline, latest points and leagues | 1 |
+| GET, PUT `/fantasy/team/squad` | Read the squad, or save the first 15 | 1, 4 |
+| PUT `/fantasy/team/lineup` | Rearrange the XI and armbands. Send `If-Match` | 1, 4 |
+| POST `/fantasy/team/transfers/preview` | A 15-minute quote: costs, bank, free transfers, hit, `valid`, `violations`, `priceRevision` | 4 |
+| POST `/fantasy/team/transfers/confirm` | Confirm a quote with an `Idempotency-Key` header. A retry returns the original receipt (`replayed: true`) | 4 |
+| POST `/fantasy/team/transfers` | Legacy one-step transfer (with `If-Match`) | 1 |
+| GET `/fantasy/team/transfers/ledger` | Transfer history with receipts | 4 |
+| POST `/fantasy/team/autopick/preview` | A greedy legal squad suggestion (nothing saved) | 4 |
+| GET, POST `/fantasy/team/chips`, DELETE `/fantasy/team/chips/{chip}` | List and play chips. Bench Boost and Triple Captain can be cancelled before the deadline; Wildcard can't | 1, 4 |
+| GET `/fantasy/team/points?gameweek=N` | Team total and breakdown, provisional while live | 1, 5 |
+| GET `/fantasy/team/points/explain` | Per-player, per-fixture explanation, including correction messages | 5 |
+| GET `/fantasy/team/history` | Past gameweeks with rank movement | 5 |
+| GET, POST `/fantasy/leagues` | The caller's leagues (including Overall), or create a private league | 1 |
+| POST `/fantasy/leagues/join`, `/{id}/leave`, `/{id}/owner`, `/{id}/archive` | Join by exact code, leave, transfer ownership, archive | 1, 3 |
+| GET `/fantasy/leagues/{id}/standings`, `/{id}/history` | Standings (`overall` for every team) and history. Rate-limited | 1, 5 |
+
+**Writes need a target gameweek.** Every squad, lineup, transfer and chip write names `gameweekId` (Sprint 4). A write for a locked week never edits the next one.
+
+### Admin (verified admin; support and operators share the role)
+
+| Method and path | What it does | Sprint |
+|---|---|---|
+| POST `/admin/gameweeks` | Create a week | 1 |
+| PUT `/admin/gameweeks/{id}/deadline` | Edit a deadline (only before it passes) | 2 |
+| POST `/admin/gameweeks/{id}/lock` | Run the deadline lock (snapshots squads) | 4 |
+| PUT `/admin/fixtures/{id}/gameweek`, GET `/admin/fixtures/{id}/gameweek-history` | Move a fixture between weeks with a reason. A locked week needs `confirmLockedChange: true`. Full history | 2 |
+| GET, POST `/admin/gameweeks/{id}/settlement` | Settlement state, each fixture's outcome, blockers, `canFinalise`, `amendmentNeeded`. POST records a transition | 5 |
+| POST `/admin/fixtures/{id}/resolution` | Record a manual resolution when there's no worker evidence | 5 |
+| POST `/admin/gameweeks/{id}/score` | Finalise (publish the final revision atomically) | 1, 5 |
+| POST `/admin/gameweeks/{id}/corrections/preview`, `/corrections` | Preview and publish an amendment with source and reason | 5 |
+| GET `/admin/gameweeks/{id}/revisions` | Published revisions | 5 |
+| GET `/admin/diagnostics` | Alerts, stalled live fixtures, provider quota and freshness | 8 |
+| POST `/admin/staging-kit/reset` | Reset staging test accounts. Never enabled in Production | 6 |
+| POST, GET `/admin/transfer-windows`; POST `/admin/prices/preview`, `/admin/prices/recalculate` | Transfer windows and price runs | 1 |
+| PUT `/admin/players/{id}/price-override`, `/admin/players/{id}/available` | Price and availability overrides with a reason | 1, 2 |
+| PUT `/admin/users/{id}/suspension` | Suspend or restore a manager (hidden from Overall; reads only) | 3 |
+
+Admin writes go to `app.admin_audit_log` (V048, Sprint 7). An audit failure never fails the request.
+
+## Rules as built (rulebook `2026-27.v1`, points table `2026-27.points.v1`)
+
+Every number is in `Fantasy/FantasyRules.cs` and served by `GET /rules`.
+
+**Squad and money**
+- **Budget:** R100.0m. Money is in millions of rand with one decimal.
+- **Squad:** 15 players (2 GK, 5 DEF, 5 MID, 3 ATT), at most 3 from one club.
+- **Formations:** 4-3-3, 4-4-2, 3-5-2, 3-4-3, 5-3-2.
+- **Deadline:** 90 minutes before the week's first kickoff, shown in UTC and SAST.
+
+**Transfers and chips**
+- **Transfers:** 1 free per gameweek, no rollover. Each extra transfer costs −4.
+- **Captaincy:** captain ×3, vice-captain ×2.
+  - The vice gets the captain's ×3 only if the captain plays **0 minutes across the whole gameweek**.
+  - A missing armband is filled by a deterministic pick from the XI.
+- **Chips:** each once per season, one per gameweek.
+  - Wildcard waives charged hits.
+  - Bench Boost counts the bench.
+  - Triple Captain: captain ×4, passing to the vice (×4) if the captain plays 0.
+- **No Free Hit. No automatic substitutions.**
+
+**Scoring per fixture**
+
+| Event | Points |
 |---|---|
-| GET `/health` | Public. Queries the latest sync job and reports DB reachability. Returns 503 if the query fails. A reachable DB can contain stale football facts. |
-| GET `/seasons/current` | Public. Resolves the PSL season flagged current. Ensure only one such season for predictable selection. |
-| GET `/teams` | Public. Lists non-placeholder teams in name order, including crest where available. This query has no season filter. |
-| GET `/players` | Public. Lists players with decoded position, latest lineup club for the current season, image and season price. A missing price falls back to the position floor. The player collection itself is not restricted to those with a current-season lineup. |
-| GET `/fixtures?from=…&to=…` | Public. Current season, inclusive time bounds, fixture IDs, names, score, raw state and decoded status. Kickoff field is `kickoffUtc`. |
-| GET `/gameweeks?seasonId=…` | Public. Returns calendar dates, season and `readyToScore` derived from marked sync rows. |
-| GET `/me` | Bearer. Finds or provisions one app profile per Supabase subject. The DB keeps the integer profile ID across identity linking. |
-| GET, POST `/fantasy/team` | Bearer. Read or create the caller’s team for this season. POST takes `{"name":"Soweto XI"}`. A duplicate conflicts. |
-| GET `/fantasy/team/snapshot` | Bearer. Team, squad, chips used, free transfers, deadline, latest points, leagues and generation time. Latest points can be absent. A client must implement persistent caching for offline viewing. |
-| GET, PUT `/fantasy/team/squad` | Bearer. GET accepts an optional gameweek **number**. PUT saves the first complete pick with formation, internal player IDs for starters and ordered bench, captain, vice and optional intended week. Repeating initial selection after a squad exists conflicts. |
-| PUT `/fantasy/team/lineup` | Bearer. Rearrange existing players for the writable week and set captaincy. Send the squad ETag in `If-Match`. |
-| POST `/fantasy/team/transfers` | Bearer. Send equal-length `out` and `in` internal player-ID arrays and optional gameweek number. Validates squad and funds, records swaps, updates the balance and returns the cost and squad. |
-| POST `/fantasy/team/chips` | Bearer. Takes `chip` and optional gameweek. Records seasonal use and the entry’s active chip. |
-| GET `/fantasy/team/points?gameweek=N` | Bearer. Defaults to the latest week whose deadline has passed. Returns team total, breakdown and provisional/fixture information where available. |
-| GET, POST `/fantasy/leagues` | Bearer. List the caller’s leagues including Overall, or create a named private league. The creator’s team joins immediately. |
-| POST `/fantasy/leagues/join` and `/fantasy/leagues/{id}/leave` | Bearer. Join by exact code, leave by numeric league ID. The owner cannot leave. Leaving sets a timestamp and rejoining clears it. |
-| GET `/fantasy/leagues/{id}/standings?gameweek=N` | Bearer. Private league membership matters. Use `overall` for all teams in the season. Optional week selects gameweek standings. |
-| POST `/admin/gameweeks` | Verified admin. Internal season ID, name, date bounds and optional explicit UTC deadline. Validates overlaps. |
-| POST `/admin/gameweeks/{id}/score` | Admin. Uses the **database gameweek ID**. Recomputes the breakdowns and team totals in a transaction. |
-| POST, GET `/admin/transfer-windows` | Admin. Create official season windows with start/end dates or list them by season. |
-| POST `/admin/prices/preview?seasonId=N` and `/admin/prices/recalculate?windowId=N` | Admin. Preview valuation without saving, or apply a window run. A repeated run requires an explicit force choice. |
-| PUT `/admin/players/{id}/price-override` | Admin. Internal player ID, season, expected minutes and/or price, plus a reason. The schema’s availability override table is a separate feature with no corresponding controller here. |
+| Appearance, 45+ minutes | +1 |
+| Full match (started, on the pitch at the final whistle) | +2 in total |
+| Goal (event 14) or penalty goal (16) | +3 |
+| Assist (the goal's related player) | +2 |
+| Clean sheet (GK or DEF, 60+ minutes, team conceded 0 in the match) | +2 |
+| Yellow | −1 |
+| Red, or second yellow (21) | −2 (a second yellow counts as a red only) |
+| Own goal (event 15) | −2 |
 
-## Example handoff from mobile to the API
+**What isn't scored or counted**
+- **Not scored:** missed penalties, saves, defensive contributions, bonus points.
+- **Unattributed goals and cards:** they count for the team (for example, for clean sheets) but give nobody points.
+- **Awarded (17) and walk-over (14):** results stand, with no player points.
 
-After signing in, call `GET /api/v1/me` with the Supabase access token, then `POST /api/v1/fantasy/team` with a name. Read the current season’s player list and the team’s next gameweek. The first selection uses `PUT /api/v1/fantasy/team/squad`. This example illustrates the shape. Replace each example ID with an eligible internal player ID and the week number returned for the target season.
+**Minutes** come from the XI (lineup type 11), substitutions (event 18) and reds.
+- Counting is inclusive: a 46' substitution gives 46 minutes to the player going off and 45 to the player coming on.
+- 45+x counts as 45, and 90+x as 90.
 
-```json
-{
-  "formation": "4-4-2",
-  "starters": [101, 201, 202, 203, 204, 301, 302, 303, 304, 401, 402],
-  "bench": [102, 205, 305, 403],
-  "captainId": 401,
-  "viceCaptainId": 301,
-  "gameweek": 10
-}
-```
+**Match states:** all 25 provider states are mapped explicitly (`MatchStateMatrix` in `Business/MatchStatus.cs`). An unrecognised code becomes status `Unknown`, flagged for review and never treated as scheduled.
 
-In this illustration the 100s are keepers, 200s defenders, 300s midfielders and 400s attackers. Real IDs carry no positional meaning. For an accepted save, compare the returned team ID, 15 players, version and remaining budget with a fresh snapshot on the second device. To change only the captain, retrieve the current ETag and send the same player selection with revised armbands to the lineup route. To replace a midfielder, send a transfer payload such as `{"out":[301],"in":[399],"gameweek":10}` to the transfers route. The API checks the incoming player's actual position, price and club.
+**Gameweeks:** a fixture belongs to the week it is **assigned** to (`app.fixture_gameweek_assignments`, V043, with history). Double weeks add the scores up. Postponed fixtures leave their week (default decision 1).
 
-## Identity and response handling
+**Ties**
+- Leagues: points, then overall points, then username, then team id.
+- PSL table: points, goal difference, goals for, club name.
 
-The API can verify tokens from the project’s JWKS endpoint and supports an explicitly configured legacy JWT secret. Google/Apple provider credentials belong in the Auth provider configuration. Being signed in to a provider still requires a Supabase session from the correct project. Native social callbacks remain client work.
+## Finalisation and corrections (Sprint 5)
 
-| Response | Client or operator action |
-|---|---|
-| 400 validation | Display each item in `errors`. Keep the selection so the fan can fix it. An unreadable version header is also invalid. |
-| 401 / 403 | Restore or renew the session for 401. A signed-in fan without membership or admin authority cannot perform the restricted operation. |
-| 404 | An absent team invites creation. An unknown week requires calendar handling. The public current-season lookup can return 503 when no PSL season is flagged. Use the originating route to choose the state. |
-| 409 account conflict | On `/me`, `legacy_email_unlinked` calls for verified support-assisted linking. `email_in_use` calls for sign-in via the original identity and provider linking. Email alone cannot establish ownership. |
-| 409 squad conflict | Use the returned `current` state when present, reload the squad and let the fan review the edit. Handle locked weeks and duplicate creates separately. |
-| 304 | A matching `If-None-Match` GET has no response body. Reuse the corresponding account-scoped representation. |
-| 503 | Inspect the problem title and logs. Missing schema, unresolved minute codes and database unavailability require different fixes. The older migration numbers in an error message should be reconciled with the [Flyway guide](DB.md). |
+**Before finalising**
+- **Settlement is a state machine** per gameweek (V047).
+- **Finalising never runs on fixture states alone.** Every finished fixture needs one of two kinds of evidence:
+  - the worker's `marked_complete` in `sync.gameweek_sync_status` (0 rows today);
+  - or a recorded admin resolution.
+- **Unattributed events:** a 48-hour hold applies first, even when worker evidence exists.
+- **Suspended fixtures:** not settled, so they block finalising. Awarded and postponed fixtures are settled.
 
-`If-Match` is accepted by lineup and transfer writes. Prove two simultaneous writes to the same version on PostgreSQL before promising lost-update protection. Browser clients also need ETag exposed by CORS to read it across origins. A UI retry after a network timeout should reload server state before repeating a purchase or transfer.
+**Finalising**
+- `POST /admin/gameweeks/{id}/score` publishes one final revision atomically. An interrupted run resumes on the next call.
+- Finalising never rescores entries saved under another rules version.
 
-## What constitutes a legal team
+**After finalising**
+- A provider correction changes nothing until an operator previews and publishes an **amendment** with a source and reason.
+- An amendment rescores every team and creates a new revision. Managers see a correction message on `/points/explain`.
 
-Money is in **millions of rand**. A value of `7.5` displays as R7.5m. `FantasyTeamService` explicitly assigns the configured R300.0m when creating a team. An initial squad has 2 goalkeepers, 5 defenders, 5 midfielders and 3 attackers. No duplicates, at most three from one real club, and no unknown playing position. A missing club can produce a warning. Position IDs 24–27 decode to GK, DEF, MID and ATT respectively.
+**Live points:** these are provisional, cached for 60 seconds, and recomputed from the same corrected rows every view reads.
 
-The XI has one keeper and a permitted DEF–MID–ATT formation: 4-3-3, 4-4-2, 3-5-2, 3-4-3 or 5-3-2. Four players sit on the ordered bench, including one keeper. Captain and vice are separate starters. A new week can show the previous picks before materialising that week’s rows. At the deadline, the service can fill missing armbands from the XI. Once a fan has picked the initial 15, use lineup changes to rearrange the same players and transfers to change personnel.
+## Withdrawn rows and freshness
 
-One free transfer per gameweek, no rollover, then four points per additional transfer. The three chips are `wildcard`, `bench_boost` and `triple_captain`. Each is usable once per team per season, with one chip in a week. A wildcard removes transfer hits, Bench Boost counts the bench, and Triple Captain changes the armband multiplier. No automatic bench substitutions are implemented.
+**Withdrawn rows** (Sprint 8, with the sync owner's V040/V041)
+- The worker marks an event or lineup row the provider stopped listing (a VAR reversal or a reissued correction) with `withdrawn_at`.
+- Every API read filters `withdrawn_at IS NULL`. Before V040 the column doesn't exist and every row counts.
+- The worker's rescind flag (`rescinded = true`) is also honoured.
+- **Deploy order:** the API with this filter (PR #13) must be live before V040 runs in production. V040 is already on sync `main`.
 
-## How a match becomes a score
+**Revision**
+- Match detail shows the worker's revision `s{n}` from `sync.fixture_freshness` when that table has the fixture (`revisionSource` says which).
+- Otherwise it shows the API's content hash `r-…`. The hash ignores timestamps and changes on any correction.
 
-A kickoff belongs to a gameweek if its **SAST calendar date** is within that season’s inclusive dates. The stored deadline wins, otherwise the service derives it from the first kickoff. Calendar order supplies the week number. Keep week number, week row ID, provider season ID and internal season ID distinct.
+**Stale**
+- A live fixture is stale when `sync.live_fixture_health.poll_health = 'stalled'`.
+- Otherwise freshness uses a 75-minute window. The fallback works before V040.
 
-`MatchFactsService` joins lineup rows and events to internal players through Sportmonks IDs. Starter/bench status and substitution direction determine minutes. `Scoring.cs` accumulates per-fixture contributions. A 45-minute appearance earns 1 point, a full match 2 in total. A goal earns 3, an enabled assist 2, a qualifying clean sheet for a GK/DEF 2 after at least 60 minutes. Yellow costs 1, red costs 2 and an own goal costs 2. A captain who plays has a ×3 multiplier and a playing vice normally has ×2. Triple Captain raises the armband to **×9 in code**. If the captain plays zero minutes the vice takes the armband. Confirm this in release copy because descriptive text in the fantasy README also mentions ×4.
+**"Should be live"** is states {2, 3, 4, 6, 9, 11, 16, 18, 19, 21, 22, 23, 25, 26}, matching the sync owner's V040 view. It drives watching and alerts only. Status and scoring stay as the state matrix says, so suspended, delayed, awaiting-updates and pending fixtures are watched but not scored.
 
-**Worked example under these settings.** A starting midfielder plays the full match and scores one goal, with no other scoring events. The base contribution is 2 + 3 = 5. As captain that is 15, or 45 under Triple Captain. Transfer hits are applied to the team total after counted player contributions. `points_results.points` stores the base score. The breakdown and team entry explain why the manager’s total differs.
+## Error codes
 
-A provisional computation can be cached for 60 seconds. Finalisation accepts a marked-complete sync row **or** a nonempty set of entirely final fixtures (state IDs 5, 7, 8). It recomputes and upserts each team/player/week breakdown, saves each team total and clears the week cache. A final whistle alone can precede the full event feed. Agree the evidence needed for publishing official scores and which operator reruns a corrected week. Starter, bench and substitution direction are still unset in `Business/SportmonksCodes.cs`. The protected scoring and price paths can return 503. A missing points value should remain distinguishable from a genuine zero.
+Every error is `application/problem+json` with a `code`; rule violations also list `errors`. Full table: `docs/api/errors.md`.
 
-Private leagues support 20 teams by default. Membership and owner checks constrain access. Standings are derived from team totals with gameweek/overall points and username tie-breaking. Overall is a virtual season-wide league. For price changes, `PricingService` gathers PSL-only history, `PlayerValuation` smooths points per 90 toward a position average, weights past seasons 0.6/0.3/0.1, projects minutes, ranks within position and rounds to R0.5m. A new player can fall back to the position floor. Preview before a transfer-window run, record overrides with a reason and preserve price history.
+| Status | `code` | App action |
+|---|---|---|
+| 400 | `rule_violation`, `insufficient_funds` | Show the errors or shortfall; keep the selection |
+| 400 | `target_gameweek_required`, `idempotency_key_required` | Send `gameweekId`; send a UUID `Idempotency-Key` per confirmation |
+| 401 | (JWT handler), `invalid_subject` | Refresh the session or sign in again |
+| 403 | `forbidden`, `account_suspended`, `account_deleted`, `reauthentication_required` | Hide the action; show the notice; sign out; ask for a fresh sign-in |
+| 404 | `not_found` | For example, offer to create a team |
+| 409 | `stale_squad`, `gameweek_locked`, `squad_already_picked` | Reload `current`; move the edit to `current.nextGameweek`; load the saved squad |
+| 409 | `price_changed`, `quote_expired`, `idempotency_key_reused` | Show the new quote in `current`; use a new key |
+| 409 | `username_taken`, `chip_not_cancellable`, `legacy_email_unlinked`, `email_in_use` | Ask again; explain; show the account-recovery text |
+| 429 | (rate limit) | Back off and retry |
+| 503 | title "Schema not ready", "Sportmonks codes not confirmed" | A migration or code mapping is missing: retry later |
 
-## Local development and the first hosted release
+## Migrations this API depends on
 
-From the dedicated checkout, use the .NET 10 SDK, a development PostgreSQL database migrated by Sync, and the matching development Supabase Auth project. Populate a local `.env` from `.env.example` with `ConnectionStrings__Touchline` and `Supabase__Url`. Deployment environment variables take precedence. Configure `Supabase__JwtSecret` only for a project using legacy symmetric signing. Use `app_api_user` for SQL.
+API files `docs/migrations/007–012` are canonical in touchline-sync as **V043–V048** (offset 36). Each is safe to rerun and grants no DELETE. The API works before and after each one: a feature whose migration is missing returns `503 Schema not ready`. Status and apply order are in [DB.md](DB.md#v043v048-api-sprints-27).
+
+## Local development
+
+**Setup:** use the .NET 10 SDK, a development PostgreSQL migrated by Flyway, and the matching development Supabase Auth project. Copy `.env.example` to `.env` and fill in `ConnectionStrings__Touchline` and `Supabase__Url` privately. Connect as `app_api_user`.
 
 ```sh
 dotnet restore Touchline.sln
 dotnet run --project src/Touchline.Api
-# Separate terminal, from the repo root
 dotnet test Touchline.sln
 ```
 
-The development HTTP profile is on port 5147. Open `/scalar`, then compare health, current season, fixtures and a signed-in `/me` request. Auth integration tests need Docker for disposable PostgreSQL. The checked-in fixture still reads a missing `docs/proposed-migrations/V033__app_users_supabase_auth_link.sql`. Bring the canonical V033 from Sync into the test build through a pinned migration input. Skipped DB tests cannot demonstrate a successful migration.
+**PostgreSQL tests**
+- The tests build a disposable database from the pinned migrations in `tests/db/flyway`: sync `main` at `3d63fd0` plus V042, then V043–V048.
+- CI uses Testcontainers with `TOUCHLINE_REQUIRE_DB_TESTS=true`.
+- Locally, point `TOUCHLINE_TEST_PG` at any throwaway server.
 
-**Hosting recommendation for discussion:** deploy the dedicated service to Azure App Service using a supported .NET 10 runtime or a container you build with that runtime. Keep Netlify web and ingestion operational. Use a team-owned HTTPS hostname and separate staging/production settings. Configure `ASPNETCORE_ENVIRONMENT=Production`, a runtime connection string, the matching Auth URL, explicit `Cors__AllowedOrigins__0` etc., and the host’s listening port. Use `dotnet publish src/Touchline.Api -c Release` for a framework-dependent release when the host supplies the runtime. Register `/api/v1/health` as the readiness probe. Store credentials in hosting settings and keep normal API startup independent of schema migration. [Microsoft hosting configuration](https://learn.microsoft.com/en-us/azure/app-service/configure-language-dotnetcore)
+**Hosting:** see `docs/api/deployment.md` and `docs/ops/release-runbook.md`. The host is still an open decision.
 
-First migrate staging, deploy the API, check DB and auth, then install an Expo preview build pointing at it. Confirm 401 without a token, 200 with the right user, denial for another user’s private league, recovery from a stale edit, and a clean signed-in cold start. Keep the previous service revision available for rollback and keep schemas backward-compatible with installed versions. Record URLs and deploy IDs in the [master decision record](MASTER.md) when verified. The main gaps before a single public base URL are standings, rankings, match detail and news routes with shapes both clients can consume.
+## What's done / what's missing
+
+### Done (Sprints 1–8; PR #6 merged, #14 and #8–#13 open)
+
+| Sprint | Delivered |
+|---|---|
+| 1 Football facts | One state matrix for all 25 states, the match clock, the PSL table, match detail, the revision, and Postgres-only reads |
+| 2 Season rules | Rulebook and `GET /rules`, persisted week numbers and fixture assignment (V043), rules versions (V044), reference week (65 / 61) |
+| 3 Accounts | Usernames, favourite club, export, deletion, suspension, notification preferences (V045) |
+| 4 Safe writes | Target gameweek, row lock and version, quotes and idempotent receipts, deadline lock snapshot, chip cancellation (V046) |
+| 5 Settlement | Settlement state machine, resolutions, revisions and amendments, explain and history (V047) |
+| 6 Frontend contract | Clubs, player and club detail, rankings, compatibility routes, paging, OpenAPI, examples, staging kit |
+| 7 Operate and secure | Health split, rate limits, startup validation, admin audit log (V048), CI secret scan, access matrix |
+| 8 Sync alignment | `withdrawn_at` filter, worker freshness and revision, stalled-fixture alerts, admin diagnostics, migrations renumbered to V043–V048 |
+
+Phatu's checklist coverage is 97 API-owned items: 89 done, 5 partial (blocked on other owners or staging), 3 other owner or conflict. The detail is in `docs/sprints/PHATU-COVERAGE.md`.
+
+### Sprint 9 (planned, not built)
+
+- **Read the sync owner's V041 tables in the API:**
+  - `sync.fixture_completeness`, as worker evidence for settlement next to `gameweek_sync_status`, replacing most manual resolutions;
+  - `sync.late_corrections`, to raise `amendmentNeeded` and the correction message;
+  - `sync.fixture_schedule_changes`, to drive fixture reassignment;
+  - `sync.event_changes`, to explain corrections on `/points/explain`.
+- **Remove Google from the provider checklist** (`docs/accounts/provider-checklist.md`). The agreed sign-in options are Facebook and Apple ([AUTH](AUTH.md)).
+
+### Missing: needs the sync team
+
+1. **Rename the sync owner's V042 to V049.** V043 merged to sync `main` before V042. Flyway won't apply an older pending version after a newer one, unless `outOfOrder` is used. Don't run `flyway migrate` on a shared database until this is resolved.
+2. **Restart the data feed:**
+   - fix the event and lineup sync, which stopped on 1 Nov;
+   - backfill the 2025/26 lineups.
+3. **One live writer:** cut over from the Netlify football schedules to the Python worker at one recorded time, or have both writers take V042's `scheduler_lease`.
+4. **Populate `sync.gameweek_sync_status`** (0 rows). Until then, every finished fixture needs an admin resolution before finalising.
+5. **Exclude postponed fixtures** (state 10) from completeness (`assess_fixture()`).
+6. **Use the API's gameweek assignment:** once V043 is applied, `sync.gameweek_for()` and the reschedule triggers should use `app.fixture_gameweek_assignments` (newest row per fixture). That needs `SELECT` on it for the worker.
+7. **Reissued corrections:** mark the stale event withdrawn or rescinded, or delete it. The API handles all three.
+8. **Credentials:**
+   - rotate the `sync_worker_user` password, which is committed in V001;
+   - remove passwords from V001.
+9. **Repo hygiene:** fix touchline-sync's 14 Dependabot alerts (4 critical) and run a full-history secret scan.
+10. **Guide fixes:**
+    - BACKEND_INTEGRATION.md: budget 100.0, price default 4.0, all 25 states, the gate exists;
+    - own goal is event 15;
+    - short codes for 5 clubs.
+11. **Provider timestamp:** store Sportmonks' own update time, so provider delay can be measured.
+
+### Missing: needs other owners
+
+1. **Sportmonks account holder:** the key is on the free plan, with no PSL data since 18 Nov. Restore the subscription. The API keeps serving the last data with stale flags.
+2. **Ops:**
+   - rotate `app_api_user` (its password is also in V001);
+   - staging load test (`docs/load`);
+   - timed restore;
+   - rotation rehearsal;
+   - production-role access tests;
+   - run the deadline lock and settlement routes each gameweek, or automate them;
+   - log retention.
+3. **Supabase dashboard owner:**
+   - provider credentials and callbacks (`docs/accounts/provider-checklist.md`);
+   - an Apple secret rotation owner;
+   - Facebook live;
+   - MFA for admins;
+   - two staging kit accounts.
+4. **Mobile owner:**
+   - callback round-trip sign-off;
+   - the staging kit flow;
+   - a push provider (`docs/api/delivery-proposal.md`).
+5. **Web owner** (`docs/api/web-migration.md`):
+   - switch to `kickoffUtc`;
+   - retire synthetic ratings;
+   - send `gameweekId` and idempotency keys;
+   - the club slug map;
+   - stop storing passwords in localStorage.
+6. **News-service owner:** decide on `docs/api/news-proposal.md`.
+7. **Support:** `legacy_email_unlinked` linking, Supabase Auth deletion within 30 days, and how to use `/points/explain`.
+8. **Legal and product:**
+   - image hotlinking and retention rights;
+   - provider-derived fixtures stored in git;
+   - rulebook sign-off.
+9. **Privacy officer:** POPIA review (`docs/security/privacy-inventory.md`).
+10. **Independent security reviewer:** review and retest.
 
 ## File catalogue
 
-This revision contains **73 tracked files**. Combine each directory heading with the filename beneath it. The entries name responsibilities and selected declarations or direct source dependencies. Installed libraries, Git metadata, caches and intermediate builds are local machine state. The private `.env` supplies runtime settings. Share setting names through the example files.
+The tip of the stack has **224 tracked files**. Paths start at the checkout. Source files are listed one by one. Tests, docs and SQL are listed by folder.
 
-### Repository root
+### Repository root and CI
 
-| File | Responsibility and connections |
+| File | Responsibility |
 |---|---|
-| `.editorconfig` | Maintains C# formatting and analysis conventions in IDEs. |
-| `.env.example` | Lists environment setting names and formats. Supply actual values privately per environment. |
-| `.gitignore` | Git exclusions for local settings and generated files. |
-| `Directory.Build.props` | Applies shared MSBuild properties to the solution. |
-| `README.md` | Repository reference for . setup and use. Compare its assumptions with the inspected code. |
-| `Touchline.sln` | Groups the API and its test project for restore, build and CI. |
-
-### `.github/workflows`
-
-| File | Responsibility and connections |
-|---|---|
-| `ci.yml` | Builds Release on .NET 10 and runs the solution tests with required Docker-backed auth coverage. |
-
-### `docs/proposed-migrations`
-
-| File | Responsibility and connections |
-|---|---|
-| `V034__fantasy_core.sql` | Historical proposal for fantasy state. Use Sync’s numbered V035 for the canonical migration. |
-
-### `docs`
-
-| File | Responsibility and connections |
-|---|---|
-| `staging-smoke-test-social-sign-in.md` | Repository reference for staging smoke test social sign in. Compare its assumptions with the inspected code. |
-
-### `src/Touchline.Api/Business`
-
-| File | Responsibility and connections |
-|---|---|
-| `MatchStatus.cs` | Decodes provider fixture states for mobile responses and determines finality for scoring. Defines `MatchStatus`, `MatchStatusExtensions`. |
-| `Position.cs` | Maps provider position IDs to the four fantasy roles or Unknown. Defines `Position`, `PositionExtensions`. |
-| `SportmonksCodes.cs` | Central provider codes including the unset lineup/substitution mappings that gate minutes. Defines `SportmonksCodes`, `PositionIds`, `EventTypes`. |
-
-### `src/Touchline.Api/Controllers`
-
-| File | Responsibility and connections |
-|---|---|
-| `FantasyControllers.cs` | Routes protected team, league and admin operations and passes token-derived users into services. Defines `FantasyControllerBase`, `FantasyTeamController`, `FantasyLeaguesController`. |
-| `FantasyFilters.cs` | Converts domain failures to ProblemDetails and adds ETags and private cache semantics. Defines `FantasyExceptionFilter`, `ETagAttribute`. |
-| `FixturesController.cs` | HTTP boundary for fixtures operations. Dispatches to the service layer. Defines `FixturesController`. |
-| `GameweeksController.cs` | HTTP boundary for gameweeks operations. Dispatches to the service layer. Defines `GameweeksController`. |
-| `HealthController.cs` | HTTP boundary for health operations. Dispatches to the service layer. Defines `HealthController`. |
-| `MeController.cs` | HTTP boundary for me operations. Dispatches to the service layer. Defines `MeController`. |
-| `PlayersController.cs` | HTTP boundary for players operations. Dispatches to the service layer. Defines `PlayersController`. |
-| `SeasonsController.cs` | HTTP boundary for seasons operations. Dispatches to the service layer. Defines `SeasonsController`. |
-| `TeamsController.cs` | HTTP boundary for teams operations. Dispatches to the service layer. Defines `TeamsController`. |
-| `TouchlineControllerBase.cs` | Creates a common 503 response when no current PSL season is flagged. Defines `TouchlineControllerBase`. |
-
-### `src/Touchline.Api/Data`
-
-| File | Responsibility and connections |
-|---|---|
-| `TouchlineDbContext.cs` | Maps PostgreSQL columns across three schemas and guards writes to upstream-owned facts. Defines `TouchlineDbContext`. |
+| `.editorconfig`, `Directory.Build.props`, `Touchline.sln` | Formatting, shared MSBuild properties, solution |
+| `.env.example` | Setting names only. Real values stay private per environment |
+| `.gitleaks.toml` | Secret-scan configuration |
+| `.github/workflows/ci.yml` | Release build, full tests with required PostgreSQL tests (including the OpenAPI contract test), dependency vulnerability check, gitleaks scan of commits since 23 Nov |
+| `README.md` | Setup and orientation |
 
 ### `src/Touchline.Api`
 
-| File | Responsibility and connections |
+| File | Responsibility |
 |---|---|
-| `DotEnv.cs` | Loads nearest development environment file while retaining real environment precedence. Defines `DotEnv`. |
-| `Program.cs` | Composes database, business services, authentication, CORS and the controller middleware pipeline. Defines `Program`. |
-| `Touchline.Api.csproj` | MSBuild framework and NuGet dependency settings for Touchline.Api. |
-| `appsettings.Development.json` | ASP.NET development overrides loaded at startup. |
-| `appsettings.json` | ASP.NET base configuration loaded at startup. |
+| `Program.cs` | Composition: DB, services, auth, CORS, rate limits, controllers |
+| `DotEnv.cs` | Loads the nearest `.env`; real environment variables win |
+| `OpenApiSetup.cs` | OpenAPI document with shared problem-details responses (exported to `docs/api/openapi-v1.json`) |
+| `Operations.cs` | Incident switches and rate limits (`docs/ops/release-runbook.md`) |
+| `appsettings.json`, `appsettings.Development.json`, `Properties/launchSettings.json`, `Touchline.Api.csproj` | Configuration and project |
+
+### `src/Touchline.Api/Business`
+
+| File | Responsibility |
+|---|---|
+| `MatchStatus.cs` | The state matrix (25 states → status and phase, `Unknown` for others) and the "should be live" set |
+| `MatchClock.cs` | Where a match minute comes from (no live clock on the provider plan) |
+| `MatchFactsDecoder.cs` | Pure decoding of lineups and events into one player's facts per fixture |
+| `Position.cs` | Position ids 24–27 → GK, DEF, MID, ATT |
+| `SportmonksCodes.cs` | Provider codes: states, events (14, 15, 16, 18, 19, 21), lineup types |
+
+### `src/Touchline.Api/Controllers`
+
+| File | Responsibility |
+|---|---|
+| `ClubsController.cs`, `TeamsController.cs` | Clubs in the current season, club detail |
+| `CompatibilityControllers.cs` | `/player-rankings` and `/matches` for the web client |
+| `FantasyControllers.cs` | Fantasy team, leagues and admin routes. The user always comes from the token |
+| `FantasyFilters.cs` | Service exceptions → problem details. ETags |
+| `FixturesController.cs` | Fixture list and match detail |
+| `GameweeksController.cs`, `SeasonsController.cs` | Calendar and current season |
+| `HealthController.cs` | `/health`, `/health/ready`, `/health/freshness` |
+| `MeController.cs` | Account, notifications, export, deletion |
+| `PlayersController.cs` | Player list and detail |
+| `RulesController.cs` | The rulebook |
+| `StandingsController.cs` | PSL table |
+| `TouchlineControllerBase.cs` | Opt-in paging for public lists |
+
+### `src/Touchline.Api/Data`
+
+| File | Responsibility |
+|---|---|
+| `FootballReads.cs` | The only read path for events and lineups. Filters `withdrawn_at` |
+| `SchemaFeatures.cs` | Detects which optional tables and columns exist, so features degrade before a migration |
+| `TouchlineDbContext.cs` | EF mapping over `football` and `sync` (read-only) and `app` |
 
 ### `src/Touchline.Api/Fantasy`
 
-| File | Responsibility and connections |
+| File | Responsibility |
 |---|---|
-| `FantasyModels.cs` | Value types for formations, selections, chips and validation used by the pure rules. Defines `Formation`, `FantasyPlayer`, `SquadSelection`. |
-| `FantasyRules.cs` | Binds configurable gameplay and pricing constants used throughout the domain. Defines `FantasyRules`, `PricingRules`, `PriceRange`. |
-| `GameweekRules.cs` | Calculates SAST date membership, deadlines, finality, league and version-check behaviour. Defines `GameweekRules`, `LeagueRules`, `StandingInput`. |
-| `PlayerValuation.cs` | Computes expected return, position-relative prices and backtest metrics from history. Defines `SeasonRecord`, `PriceOverride`, `ValuationInput`. |
-| `README.md` | Repository reference for src/Touchline.Api/Fantasy setup and use. Compare its assumptions with the inspected code. |
-| `Scoring.cs` | Converts minutes and events into base points and applies lineup, armband, chip and transfer effects. Defines `PlayerFixtureFacts`, `PointsBreakdown`, `PlayerScoring`. |
-| `SquadRules.cs` | Validates roster structure and applies legal changes subject to price and role constraints. Defines `SquadRules`, `TransferOutcome`. |
-| `TransferAndChipRules.cs` | Calculates transfer costs and checks chip eligibility. Defines `TransferRules`, `TransferCost`, `ChipUse`. |
+| `FantasyRules.cs` | Every rule number, bound from configuration |
+| `Rulebook.cs` | The versioned rulebook served at `/rules` |
+| `FantasyModels.cs`, `SquadRules.cs`, `TransferAndChipRules.cs` | Formations, squad and lineup validation, transfers and chips |
+| `Scoring.cs` | Player facts → points; armbands, chips, hits |
+| `GameweekRules.cs` | Fixture membership, deadlines, finalising rules |
+| `PlayerValuation.cs` | Price model from past seasons |
+| `README.md` | The fantasy module's notes |
 
 ### `src/Touchline.Api/Models`
 
-| File | Responsibility and connections |
+| File | Responsibility |
 |---|---|
-| `AppEntities.cs` | EF entities for application-owned data used by profile, calendar and fantasy operations. Defines `AppUser`, `Gameweek`, `FantasyTeam`. |
-| `FantasyContracts.cs` | Typed HTTP request and response shapes shared by fantasy controllers and services. Defines `CreateTeamRequest`, `SquadRequest`, `TransfersRequest`. |
-| `FantasyEntities.cs` | EF entities for per-week entries, transfers, chips, memberships and pricing administration. Defines `FantasyGameweekEntry`, `FantasyTransfer`, `FantasyChipUsage`. |
-| `FootballEntities.cs` | Read models for ingested provider facts referenced by football and scoring services. Defines `Competition`, `Season`, `Team`. |
-| `ResponseModels.cs` | Public response records for football, calendar and health reads. Defines `SeasonSummary`, `TeamSummary`, `PlayerSummary`. |
-| `SyncEntities.cs` | Read models for worker job and gameweek readiness information. Defines `SyncJob`, `SyncLog`, `GameweekSyncStatus`. |
-
-### `src/Touchline.Api/Properties`
-
-| File | Responsibility and connections |
-|---|---|
-| `launchSettings.json` | Configures local HTTP/HTTPS launch profiles and opens Scalar in Development. |
+| `AppEntities.cs`, `FantasyEntities.cs` | `app` entities: users, gameweeks, teams, entries, receipts, settlement |
+| `FootballEntities.cs`, `SyncEntities.cs` | Read models for `football` and `sync` |
+| `FantasyContracts.cs`, `ResponseModels.cs`, `MatchDetailModels.cs` | Request and response shapes |
 
 ### `src/Touchline.Api/Services`
 
-| File | Responsibility and connections |
+| File | Responsibility |
 |---|---|
-| `FantasyContextService.cs` | Resolves user, current season, team and writable week and checks client versions. Defines `FantasyContext`, `FantasyContextService`. |
-| `FantasyTeamService.cs` | Coordinates team creation, initial selection, rearrangements, transfers, chips and snapshot assembly. Defines `FantasyTeamService`. |
-| `FootballOptions.cs` | Declares the binding for the target PSL provider competition. Defines `FootballOptions`. |
-| `FootballService.cs` | Projects season, players, fixtures, current clubs and prices for API reads. Defines `FootballService`, `PlayerClubRow`. |
-| `GameweekService.cs` | Orders season weeks, finds matching fixtures, resolves deadlines, reads readiness and creates weeks. Defines `GameweekInfo`, `SeasonCalendar`, `GameweekService`. |
-| `HealthService.cs` | Tests DB reachability through the job journal and returns its latest record. Defines `HealthService`. |
-| `LeagueService.cs` | Creates leagues, checks memberships and capacity, and assembles private and overall rankings. Defines `LeagueService`. |
-| `MatchFactsService.cs` | Resolves provider events and lineups to player facts and requires confirmed minutes mappings. Defines `PlayerFacts`, `MatchFactsService`. |
-| `PointsService.cs` | Builds provisional totals and finalises per-player breakdowns and team scores transactionally. Defines `GameweekPlayerPoints`, `TeamTotals`, `PointsService`. |
-| `PricingService.cs` | Loads historical evidence, previews or applies a window valuation, and manages admin inputs. Defines `PricingService`, `AdminService`. |
-| `ServiceExceptions.cs` | Typed domain failures distinguish missing records, conflicts, denied access and unavailable schema/data. Defines `SchemaNotReadyException`, `UserConflictException`, `RuleViolationException`. |
-| `SquadStore.cs` | Loads season prices and clubs, reads or materialises picks carried forward and persists weekly selections. Defines `FantasyDataService`, `LoadedSquad`, `SquadStore`. |
+| `FootballService.cs`, `FootballDetailService.cs` | Seasons, players, fixtures, prices; player and club detail, rankings |
+| `MatchDetailService.cs` | Match detail, freshness, revision (`s{n}` or content hash) |
+| `MatchFactsService.cs`, `PlayerIdBridge.cs` | Load events and lineups and map Sportmonks ids to internal players |
+| `StandingsService.cs` | PSL table with official deductions |
+| `HealthService.cs` | Readiness, freshness, stalled live fixtures |
+| `GameweekService.cs` | Calendar, assignments, deadlines |
+| `FantasyContextService.cs`, `FantasyTeamService.cs`, `SquadStore.cs` | Caller, season, team, writable week; team actions; squad persistence |
+| `SafeWriteService.cs` | Transfer quotes, confirmations, receipts, idempotency |
+| `AvailabilityService.cs` | Who can be picked and priced |
+| `PointsService.cs` | Provisional and final points |
+| `SettlementService.cs` | Settlement state, resolutions, revisions, amendments |
+| `LeagueService.cs` | Private leagues and Overall |
+| `PricingService.cs` | Price runs, windows and overrides |
+| `StagingKitService.cs` | Staging test accounts (never in Production) |
+| `FootballOptions.cs`, `ServiceExceptions.cs` | Options; typed domain failures |
 
 ### `src/Touchline.Api/Users`
 
-| File | Responsibility and connections |
+| File | Responsibility |
 |---|---|
-| `CurrentUser.cs` | Extracts the authenticated subject and email claims for downstream profile resolution. Defines `CurrentUser`. |
-| `SupabaseAuthOptions.cs` | Declares issuer/project, audience and optional legacy signing configuration. Defines `SupabaseAuthOptions`. |
-| `SupabaseAuthSetup.cs` | Configures JWT bearer validation and registers signing-key resolution. Defines `SupabaseAuthSetup`. |
-| `SupabaseSigningKeys.cs` | Caches public keys and throttles refreshes including after a key rotation. Defines `SupabaseSigningKeys`. |
-| `UserService.cs` | Resolves or creates a profile by subject and detects existing-email conflicts. Defines `UserService`. |
+| `SupabaseAuthSetup.cs`, `SupabaseAuthOptions.cs`, `SupabaseSigningKeys.cs` | Token validation; JWKS cache and refresh |
+| `CurrentUser.cs` | Subject and optional email from the token |
+| `UserService.cs` | Links a Supabase user to `app.users` |
+| `AccountService.cs`, `AccountOptions.cs`, `UsernameRules.cs` | Account features; username rules (3–20 characters, unique ignoring case) |
 
-### `tests/Touchline.Api.Tests/Auth`
+### Tests (`tests/`)
 
-| File | Responsibility and connections |
+| Folder | What it covers |
 |---|---|
-| `MeEndpointTests.cs` | Regression coverage for Me Endpoint. |
-| `PostgresFixture.cs` | Creates disposable ready, legacy and partial-schema DBs for profile integration tests. Defines `PostgresFixture`. |
-| `TestApiFactory.cs` | Boots an in-process ASP.NET host with test DB and authentication settings. Defines `TestApiFactory`. |
-| `TestTokens.cs` | Builds test-signed identities to exercise the actual bearer validation pipeline. Defines `TestTokens`, `StubJwksHandler`. |
-| `TokenValidationTests.cs` | Regression coverage for Token Validation. |
+| `Touchline.Api.Tests/Football` | State matrix, match detail, standings, architecture (no outbound calls), sync alignment |
+| `Touchline.Api.Tests/Fantasy` | Squad, scoring, transfers, chips, leagues, valuation |
+| `Touchline.Api.Tests/Reference` | Reference week (65 / 61) and the fixture replay |
+| `Touchline.Api.Tests/Accounts`, `Auth` | Accounts, token validation, `/me` |
+| `Touchline.Api.Tests/SafeWrites`, `Settlement`, `Security`, `Contract` | Concurrency and idempotency, settlement, access, OpenAPI contract |
+| `Touchline.Api.Tests/Db` | Clean install and populated upgrade of every migration |
+| `db/flyway` | Pinned canonical migrations for the test database |
+| `db/reference`, `db/replay` | Reference-week snapshot and a recorded fixture replay |
 
-### `tests/Touchline.Api.Tests/Fantasy`
+### Docs (`docs/`)
 
-| File | Responsibility and connections |
+| Folder | Contents |
 |---|---|
-| `ConflictTests.cs` | Regression coverage for Conflict. |
-| `PlayerValuationTests.cs` | Regression coverage for Player Valuation. |
-| `ScoringTests.cs` | Regression coverage for Scoring. |
-| `SquadRulesTests.cs` | Regression coverage for Squad Rules. |
-| `TestSquad.cs` | Reusable squad and player fixtures for deterministic fantasy rule tests. Defines `TestSquad`. |
-| `TransferChipLeagueTests.cs` | Regression coverage for Transfer Chip League. |
-
-### `tests/Touchline.Api.Tests`
-
-| File | Responsibility and connections |
-|---|---|
-| `SportmonksDecodingTests.cs` | Regression coverage for Sportmonks Decoding. |
-| `Touchline.Api.Tests.csproj` | MSBuild framework and NuGet dependency settings for Touchline.Api.Tests. |
+| `api/` | Errors, examples, OpenAPI, deployment, staging kit, web migration, delivery and news proposals |
+| `rules/` | Rulebook `2026-27.v1`, coverage matrix, reference week |
+| `accounts/` | Account policies, provider checklist, club mapping |
+| `migrations/` | API copies 001–012; 007–012 are canonical in touchline-sync as V043–V048 |
+| `ops/` | Fantasy operations, matchday runbook, release runbook |
+| `security/` | Access matrix, effective-permissions check, privacy inventory |
+| `load/`, `release/`, `audit/`, `plans/` | Load test, release record, fantasy audit, plans |
+| `sprints/` | Runbook, rules, the 8 sprint reports, PROGRESS, FINAL-SUMMARY, Phatu coverage |
