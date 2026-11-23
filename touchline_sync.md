@@ -1,6 +1,6 @@
 # Touchline Sync • importing football and news
 
-[Team home](MASTER.md) · [Database and migrations](DB.md) · [API scoring consumer](touchline_api.md) · [UI consumers](touchline_main.md)
+[Team home](MASTER.md) · [Database and migrations](DB.md) · [API scoring consumer](touchline_api.md) · [UI consumers](touchline_main.md) · [Sprints 3–5 (unmerged)](touchline_sync_sprints_3-5.md)
 
 **Source • checkout named `touchline`, `main@4c550f7`, 23 November 2026.** This repository owns football ingestion and the shared Flyway migration sequence. Phatu reports sync is hosted on Netlify. There are two executable football pipelines. The Netlify site deploys TypeScript functions. The Docker/Render configuration starts a Python process with its own scheduler. Checking which deployment ran a fixture is the first step in debugging stale data.
 
