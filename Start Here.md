@@ -10,6 +10,10 @@ Begin with [the team knowledge base](MASTER.md) for current project memory, agre
 - [Touchline Expo mobile plan](platform-plans/04-expo-mobile.md)
 - [Touchline news service plan](platform-plans/05-news-service.md)
 
+## Work in progress
+
+- [Sync Sprints 3–5: live freshness, corrections and operations](touchline_sync_sprints_3-5.md) (23 Nov 2026, on a branch, not yet merged)
+
 ## Screen concepts
 
 [UI concepts in Figma and offline screen overview](ui-concepts/figma-overview.md)

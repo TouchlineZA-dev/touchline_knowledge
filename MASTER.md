@@ -13,6 +13,7 @@ Touchline puts South African football in fans’ hands. A supporter can follow a
 | [Main, UI and mobile release](touchline_main.md) | What does each screen do, where does its data come from, and how do we put it on a phone? | `touchline_main_fresh` • `main@790fc10` |
 | [Platform API](touchline_api.md) | Who can read or change a squad, how are points calculated, and what needs hosting? | `touchline_api` • `phathu-dev@f887905` |
 | [Football and news sync](touchline_sync.md) | What runs on a schedule and how does a match become usable data? | `touchline` • `main@4c550f7` |
+| [Sync Sprints 3–5](touchline_sync_sprints_3-5.md) | How do live matches stay fresh, how are late corrections explained, and how does the on-call recover? | `touchline` • `sprint/3-4-live-freshness-corrections@39c3c57` (unmerged) |
 | [Database](DB.md) | Which table owns a fact, which ID joins it, and how does the team safely evolve the schema? | Flyway migrations V001–V038 in `touchline`, compared with application code in both other repositories |
 | [Accounts and sign-in](AUTH.md) | Which sign-in options has the team agreed on, and what still needs verification? | Product decision confirmed by Phatu on 23 November 2026. |
 
@@ -73,6 +74,7 @@ Any of the four backend contributors can take a change across a worker, migratio
 | Open | Football writer and freshness promise | Retain Netlify with parity work, or hand football to the Python worker after staging comparison. Decide matchday refresh target and responsibility for rescoring corrections. [Sync](touchline_sync.md) |
 | Open | Budget and scoring copy | API-created teams start at R300m. SQL defaults to R100m. Confirm the intended default and the captain/chip multipliers before publishing game rules. [Database](DB.md) |
 | Open | Shared read contract for news, match detail and standings | The plans favour one public API. Identify older clients and demonstrate parity before switching each route. [Main](touchline_main.md) |
+| Proposed · 23 November 2026 | Live freshness, corrections and operations (sync Sprints 3–5, V040–V042) | Built and tested on a branch. Needs the PSL subscription, staging migration, the API `withdrawn_at IS NULL` filter, confirmed responders and a PR. [Sprints 3–5](touchline_sync_sprints_3-5.md) |
 | Agreed · 23 November 2026 | Sign-in options | Continue with Facebook and Sign in with Apple. See the [accounts guide](AUTH.md) for the decision and remaining implementation checks. |
 | Open | Store listing continuity and v1 scope | Verify whether the existing Android bundle has been distributed. Confirm the finished screens, account deletion path and news host for the first release. [Main](touchline_main.md) |
 
