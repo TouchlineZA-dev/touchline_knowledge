@@ -164,5 +164,33 @@ For example, inspect the default on `app.fantasy_teams.budget_remaining`, the nu
 | V026–V032 | News cache creation and move, retroactive lineup grants, default privileges, job type, provider-ID renames and BIGINTs, integrity and job-state checks. |
 | V033–V035 | Link Auth subject, price-table grants, then fantasy core including squad entries, leagues, chips, transfer records and pricing controls. The API’s similarly named proposed V034 is not the released V034. |
 | V036–V038 | 28 candidate 2026/27 week ranges, RLS for seven fantasy tables, availability overrides. V036 avoids duplicating a week starting on the same day. Postponed weeks and changed kickoff times need review. |
+| V039–V042 | The sync owner's live freshness, corrections and operations: version drift and the worker's restricted `app` access, `withdrawn_at`, freshness and quota, completeness and late corrections, operations. V039–V041 merged (sync PR #3). V042 is not merged. See [Sync Sprints 3–5](touchline_sync_sprints_3-5.md). |
+| V043–V048 | API Sprints 2–7. See the next section. |
 
 **Release reconciliation:** record active Flyway version, number of flagged PSL seasons, number of seeded gameweeks, latest successful fixture refresh for the actual writer, and a team’s before/after balance. Resolve the R300m/R100m divergence through an explicit team decision and forward migration if appropriate. Never infer a manager’s original spending balance from today’s player prices. See the [sync file catalogue](touchline_sync.md) for every versioned SQL filename.
+
+## V043–V048 (API Sprints 2–7)
+
+**Status • 23 November 2026.** All six are **merged to sync `main` (or in an open PR to it); apply only after V042.**
+- V043 is merged (sync PR #4, `7fd79d4`).
+- V044–V048 are open PRs to `main`, in order.
+- The files are copies of the API's `docs/migrations/007–012` (version = API number + 36).
+- Each migration is safe to rerun and grants no DELETE.
+- The API works before and after each one. A feature whose migration is missing returns `503 Schema not ready`.
+- None has been applied to a shared database.
+
+| Version | API file | What it adds | Sync PR | State |
+|---|---|---|---|---|
+| V043 | `007_gameweek_calendar.sql` | Persisted gameweek `number`; `app.fixture_gameweek_assignments` (fixture → week, with when, why and who) | #4 | merged to sync `main` |
+| V044 | `008_rules_versions.sql` | Rules and points-table versions on entries and points | #10 (replaces #5) | open |
+| V045 | `009_accounts.sql` | Optional email, usernames, favourite club, suspension and deletion, rename history, notification preferences | #6 | open |
+| V046 | `010_safe_writes.sql` | Receipts and idempotency, granted transfers, locked snapshot, chip cancellation | #7 | open |
+| V047 | `011_settlement.sql` | Settlement state machine, fixture resolutions, score revisions | #8 | open |
+| V048 | `012_admin_audit_log.sql` | Admin audit log | #9 | open |
+
+**Apply only after V042 is resolved.**
+- **The problem:** V043 reached sync `main` before the sync owner's V042 (`V042__operations.sql`, unmerged). Flyway refuses to apply an older pending version once a newer one is applied.
+- **Proposed fix:** rename his V042 to **V049**, so the order is V039–V041, V043–V048, V049. The alternative is a one-off `outOfOrder` run.
+- **Until one of these is agreed:** don't run `flyway migrate` on a shared database.
+- **After that, for each merged PR:** `git pull`, `flyway info`, `flyway migrate`, `flyway info`.
+- **Deploy order for production:** the API with the `withdrawn_at` filter (API PR #13) before V040 runs. See [API withdrawn rows](touchline_api.md#withdrawn-rows-and-freshness).
