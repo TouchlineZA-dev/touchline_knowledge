@@ -14,9 +14,6 @@ Begin with [the team knowledge base](MASTER.md) for current project memory, agre
 
 [UI concepts in Figma and offline screen overview](ui-concepts/figma-overview.md)
 
-- [Live Match Centre](ui-concepts/touchline-live-match-centre.png)
-- [My Squad](ui-concepts/touchline-my-squad.png)
-- [Home and news](ui-concepts/touchline-home-news.png)
 
 ## Team decisions
 
