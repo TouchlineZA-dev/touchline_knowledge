@@ -2,7 +2,7 @@
 
 [Team home](MASTER.md) · [Football and news sync](touchline_sync.md) · [Database and migrations](DB.md) · [API scoring consumer](touchline_api.md)
 
-**Source • checkout named `touchline`, branch `sprint/3-4-live-freshness-corrections`, commits `7f07050` (Sprints 3–4) and `39c3c57` (Sprint 5), 23 November 2026.** Against `main@07718e1` the branch changes 61 files and adds Flyway migrations **V040–V042**. **Status: built and tested locally. Not merged, not on staging, not in production.** The detailed write-ups in the repository are `docs/sprint3/live-freshness.md`, `docs/sprint4/late-changes.md`, `docs/sprint5/operations.md` and the on-call guide `docs/runbook.md`.
+**Source • checkout named `touchline`, branch `sprint/3-4-live-freshness-corrections`, commits `7f07050` (Sprints 3–4) and `39c3c57` (Sprint 5), 23 November 2026.** Against `main@07718e1` the branch changes 61 files and adds Flyway migrations **V040–V042** (V042 later renumbered to V049). **Status: built and tested locally. Not merged, not on staging, not in production.** The detailed write-ups in the repository are `docs/sprint3/live-freshness.md`, `docs/sprint4/late-changes.md`, `docs/sprint5/operations.md` and the on-call guide `docs/runbook.md`.
 
 > **Still blocked by the subscription.** The Sportmonks key reports "Football Free Plan" and has no PSL access (re-checked on 23 Nov 2026 with `scripts/check_provider_key.py`). PSL data has not arrived since 18 Nov 2026. All latency figures below come from free-plan leagues, production's stored PSL schedule and a replay of Pirates v Chiefs (fixture 19781326). None of them is real live PSL traffic.
 
@@ -49,7 +49,7 @@ All of this lives in database triggers and functions, so the Python and Netlify 
 - **Corrections keep the same row.** A changed scorer or assist updates the same event row and increments `attribution_revision`.
 - **Out-of-order guard.** `sync.begin_fixture_observation()` runs first in every fixture write. It refuses a snapshot older than the newest one already committed.
 - **Lineups.** Missing fields keep their stored values. A row is withdrawn only when the snapshot has a complete XI (11 starters) for that team.
-- **Own goals** (type 16) are recorded on the team that benefits.
+- **Own goals** (type 15; 16 is a penalty, 14 a goal) are recorded on the team that benefits. Corrected 24 Nov 2026: V041 had the ids swapped, fixed in V050 (see below).
 - **Reschedules keep the original fixture row.** In testing: scheduled → postponed → rescheduled moved the fixture from GW9 to GW10 under the same fixture id. **The gameweek policy for moved fixtures is the API's decision.**
 - **Completeness rule v1.** Statuses are `not_finished`, `settling` (within 4 h of kickoff), `complete`, `incomplete`, and `unavailable` (still missing 72 h after kickoff, or abandoned).
 
@@ -134,3 +134,14 @@ Integration tests TRUNCATE tables, so they must never point at production.
 ## Local checkout note
 
 On Phathu's Mac the `touchline` checkout was inside iCloud Drive. iCloud created duplicate git refs (`refs/remotes/origin/HEAD 2`) and broke syncing. The checkout now lives at `~/Documents/touchline.nosync`, which iCloud skips, with a `~/Documents/touchline` symlink so existing paths still work. Anyone keeping a checkout in an iCloud-synced folder should do the same.
+
+## Sprint 6 follow-up • API handoff fixes (24 Nov 2026)
+
+Branch `sprint/6-api-handoff-fixes` (commit `cf69e84`). The full answers are in `docs/sprint6/api-handoff.md`.
+
+- **V042 is renumbered to V049** so it runs after the API team's V043–V048.
+- **V050:**
+  - Corrects the goal type ids: 14 is a goal, 15 an own goal, 16 a penalty. Every goal type now needs a scorer, and rescinded goals are ignored (completeness rule v2).
+  - A fixture's gameweek comes from `app.fixture_gameweek_assignments` through `sync.fixture_gameweek()`.
+  - Adds the `sync.gameweek_completeness` rollup, which replaces `gameweek_sync_status`.
+- **V001 no longer contains role passwords.** Run `./migrate.sh repair` once on every existing database before migrating, then rotate both role passwords.
