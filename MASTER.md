@@ -14,6 +14,7 @@ Touchline puts South African football in fans’ hands. A supporter can follow a
 | [Platform API](touchline_api.md) | Who can read or change a squad, how are points calculated, and what needs hosting? | `touchline-api` • `main@15b0a53` (Sprint 1) plus open PRs #14, #8–#13 (Sprints 2–8) |
 | [Football and news sync](touchline_sync.md) | What runs on a schedule and how does a match become usable data? | `touchline` • `main@4c550f7` |
 | [Sync Sprints 3–5](touchline_sync_sprints_3-5.md) | How do live matches stay fresh, how are late corrections explained, and how does the on-call recover? | `touchline` • `sprint/3-4-live-freshness-corrections@39c3c57` (unmerged) |
+| [Sync repository docs](touchline-sync-docs/Sync%20docs%20index.md) | Where are the sync repo's own README, runbook and sprint write-ups? | `touchline-sync` • `sprint/6-api-handoff-fixes@cf69e84` (snapshot, unmerged) |
 | [Database](DB.md) | Which table owns a fact, which ID joins it, and how does the team safely evolve the schema? | Flyway migrations V001–V038 in `touchline`, plus V039–V042 (sync owner) and V043–V048 (API Sprints 2–7), compared with application code in both other repositories |
 | [Accounts and sign-in](AUTH.md) | Which sign-in options has the team agreed on, and what still needs verification? | Product decision confirmed by Phatu on 23 November 2026. |
 
